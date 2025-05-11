@@ -1,8 +1,8 @@
 import express from 'express';
 import multer from 'multer';
 import path from 'path';
-import fs from 'fs/promises'; // Using promises version of fs
-import { existsSync, mkdirSync, readFileSync, unlinkSync } from 'fs'; // For some sync operations if needed
+import fs from 'fs/promises'; // Using promises version of fs for async operations
+import { existsSync, mkdirSync, readFileSync, unlinkSync } from 'fs'; // For some sync operations
 import { v4 as uuidv4 } from 'uuid';
 import AdmZip from 'adm-zip';
 import xml2js from 'xml2js';
@@ -32,15 +32,17 @@ const TEMP_UPLOADS_DIR = path.join(__dirname, 'temp_uploads');
 // Ensure temp_uploads directory exists
 if (!existsSync(TEMP_UPLOADS_DIR)) {
   mkdirSync(TEMP_UPLOADS_DIR, { recursive: true });
+  console.log(`Created temporary uploads directory: ${TEMP_UPLOADS_DIR}`);
 }
 
+// Configure multer storage to save files temporarily
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
-    cb(null, TEMP_UPLOADS_DIR); // Save uploaded files to temp_uploads
+    cb(null, TEMP_UPLOADS_DIR);
   },
   filename: function (req, file, cb) {
-    // Use a unique name to avoid conflicts, but keep original extension
-    cb(null, `${uuidv4()}_${file.originalname}`);
+    // Use a unique name to avoid conflicts, but keep original extension for inspection
+    cb(null, `${uuidv4()}-${file.originalname}`);
   }
 });
 
@@ -49,9 +51,10 @@ const upload = multer({
   limits: { fileSize: 200 * 1024 * 1024 }, // 200MB limit
   fileFilter: function (req, file, cb) {
     if (file.mimetype === 'application/zip' || file.originalname.toLowerCase().endsWith('.zip')) {
-      cb(null, true);
+      cb(null, true); // Accept the file
     } else {
-      cb(new Error('Invalid file type, please upload a .zip file for SCORM packages.'), false);
+      console.log(`File rejected: Invalid type - ${file.originalname}, mimetype: ${file.mimetype}`);
+      cb(new Error('Invalid file type, please upload a .zip file for SCORM packages.'), false); // Reject the file
     }
   }
 });
@@ -60,28 +63,28 @@ const upload = multer({
 
 async function parseScormManifest(extractDirPath) {
   const manifestPath = path.join(extractDirPath, 'imsmanifest.xml');
+  console.log(`Attempting to parse manifest at: ${manifestPath}`);
   try {
     if (!existsSync(manifestPath)) {
+      console.error(`Manifest file not found at: ${manifestPath}`);
       return { error: 'Manifest file (imsmanifest.xml) not found in the package.' };
     }
 
     const xmlContent = await fs.readFile(manifestPath, 'utf-8');
-    const parser = new xml2js.Parser({ explicitArray: false, ignoreAttrs: false, mergeAttrs: true }); // mergeAttrs to handle attributes easily
+    const parser = new xml2js.Parser({ explicitArray: false, ignoreAttrs: false, mergeAttrs: true, explicitRoot: true });
     const result = await parser.parseStringPromise(xmlContent);
 
     if (!result || !result.manifest) {
+      console.error('Invalid manifest structure: <manifest> root element not found.');
       return { error: 'Invalid manifest structure: <manifest> root element not found.' };
     }
     const manifest = result.manifest;
 
     let courseTitle = 'Untitled Course';
-    // Try to find title in organizations -> organization -> title
     if (manifest.organizations && manifest.organizations.organization) {
       const org = Array.isArray(manifest.organizations.organization) ? manifest.organizations.organization[0] : manifest.organizations.organization;
-      if (org && org.title && typeof org.title === 'string') {
-        courseTitle = org.title;
-      } else if (org && org.title && org.title._) { // Handle if title is an object with text content like { _: "Title Text" }
-        courseTitle = org.title._;
+      if (org && org.title) {
+        courseTitle = typeof org.title === 'string' ? org.title : (org.title._ || 'Untitled Organization');
       }
     }
 
@@ -96,9 +99,9 @@ async function parseScormManifest(extractDirPath) {
         if (org && org.item) {
             const collectItems = (itemArray) => {
                 (Array.isArray(itemArray) ? itemArray : [itemArray]).forEach(it => {
-                    if (it) { // Ensure item itself is not null/undefined
+                    if (it) {
                         items.push(it);
-                        if (it.item) { // Recursively collect sub-items
+                        if (it.item) {
                             collectItems(it.item);
                         }
                     }
@@ -117,15 +120,17 @@ async function parseScormManifest(extractDirPath) {
 
     items.forEach(item => {
         if (item.identifierref && resourceMap.has(item.identifierref)) {
-            // Check for SCORM type 'sco'
             const resourceDetails = resources.find(r => r.identifier === item.identifierref);
-            if (resourceDetails && resourceDetails['adlcp:scormtype'] === 'sco') {
+            // Check for SCORM type 'sco', often namespaced with adlcp or similar
+            const scormType = resourceDetails ? (resourceDetails['adlcp:scormtype'] || resourceDetails.scormtype) : null;
+
+            if (scormType === 'sco') {
                 let scoTitle = 'Untitled SCO';
                 if (item.title && typeof item.title === 'string') {
                     scoTitle = item.title;
-                } else if (item.title && item.title._) {
+                } else if (item.title && item.title._) { // Handle cases where title is an object like {"_": "Title text"}
                      scoTitle = item.title._;
-                } else if (item.identifier) {
+                } else if (item.identifier) { // Fallback to item identifier
                     scoTitle = item.identifier;
                 }
 
@@ -137,7 +142,7 @@ async function parseScormManifest(extractDirPath) {
             }
         }
     });
-
+    console.log(`Manifest parsed. Course Title: "${courseTitle}", SCOs found: ${scos.length}`);
     return {
       course_title: courseTitle,
       scos: scos
@@ -150,6 +155,7 @@ async function parseScormManifest(extractDirPath) {
 }
 
 async function extractTextFromHtml(htmlFilePath) {
+  console.log(`Attempting to extract text from HTML: ${htmlFilePath}`);
   try {
     if (!existsSync(htmlFilePath)) {
       console.warn(`extractTextFromHtml: HTML file not found at path: ${htmlFilePath}`);
@@ -160,19 +166,17 @@ async function extractTextFromHtml(htmlFilePath) {
     const dom = new JSDOM(htmlContent);
     const document = dom.window.document;
 
-    // Remove script and style elements
-    document.querySelectorAll('script, style, noscript, iframe, head').forEach(el => el.remove());
+    // Remove script, style, and other non-visible elements
+    document.querySelectorAll('script, style, noscript, iframe, head, link, meta').forEach(el => el.remove());
 
-    // Get text content from the body, try to be a bit more selective
     let text = '';
     if (document.body) {
         text = document.body.textContent || "";
     }
     
-    // Replace multiple whitespace characters (including newlines, tabs) with a single space and trim
-    const cleanedText = text.replace(/\s+/g, ' ').trim();
+    const cleanedText = text.replace(/\s\s+/g, ' ').trim(); // Replace multiple spaces/newlines with single space
     
-    console.log(`extractTextFromHtml: Extracted ${cleanedText.length} characters from ${htmlFilePath}`);
+    console.log(`extractTextFromHtml: Extracted ${cleanedText.length} characters from ${htmlFilePath}. Preview: "${cleanedText.substring(0,100)}..."`);
     return cleanedText; // Return text string directly on success
 
   } catch (error) {
@@ -183,11 +187,11 @@ async function extractTextFromHtml(htmlFilePath) {
 
 async function getGeminiMetadata(textContent, apiKey) {
   if (!textContent || typeof textContent !== 'string' || !textContent.trim()) {
-    console.log('getGeminiMetadata: Text content is empty or invalid, skipping Gemini API call.');
+    console.warn('getGeminiMetadata: Text content is empty or invalid, skipping Gemini API call.');
     return { error: 'Text content is empty or invalid, skipping Gemini API call.' };
   }
   if (!apiKey) {
-    console.log('getGeminiMetadata: Gemini API key is missing.');
+    console.error('getGeminiMetadata: Gemini API key is missing. Cannot make API call.');
     return { error: 'Gemini API key is missing.' };
   }
 
@@ -230,9 +234,11 @@ Respond *only* with the JSON object, without any leading or trailing text or mar
         const jsonTextResponse = data.candidates[0].content.parts[0].text;
         console.log('getGeminiMetadata: Received text from Gemini, attempting to parse as JSON.');
         try {
-          return JSON.parse(jsonTextResponse);
+          const parsedJson = JSON.parse(jsonTextResponse);
+          console.log('getGeminiMetadata: Successfully parsed JSON from Gemini.');
+          return parsedJson;
         } catch (parseError) {
-          console.error('getGeminiMetadata: Error parsing JSON from Gemini response:', parseError);
+          console.error('getGeminiMetadata: Error parsing JSON from Gemini response text:', parseError);
           console.error('getGeminiMetadata: Gemini raw text response was:', jsonTextResponse);
           return { error: 'Failed to parse JSON from Gemini API response text', details: jsonTextResponse };
         }
@@ -272,6 +278,7 @@ app.post('/api/upload-scorm', upload.single('file'), async (req, res) => {
 
   const baseName = path.parse(originalFileName).name;
   const uniqueId = uuidv4();
+  // Ensure extractDir is within TEMP_UPLOADS_DIR which is already joined with __dirname
   const extractDir = path.join(TEMP_UPLOADS_DIR, `${baseName}_${uniqueId}`);
 
   try {
@@ -284,17 +291,7 @@ app.post('/api/upload-scorm', upload.single('file'), async (req, res) => {
     const zip = new AdmZip(uploadedFilePath);
     zip.extractAllTo(extractDir, /*overwrite*/ true);
     console.log('ZIP file extracted successfully.');
-
-    // Clean up the uploaded zip file from temp_uploads (multer's storage)
-    try {
-      await fs.unlink(uploadedFilePath);
-      console.log(`Successfully deleted temporary zip file: ${uploadedFilePath}`);
-    } catch (unlinkErr) {
-      console.error(`Error deleting temporary zip file ${uploadedFilePath}:`, unlinkErr);
-      // Non-fatal, continue processing
-    }
     
-    console.log('Parsing SCORM manifest...');
     const manifestData = await parseScormManifest(extractDir);
 
     const apiResponse = {
@@ -309,19 +306,19 @@ app.post('/api/upload-scorm', upload.single('file'), async (req, res) => {
       apiResponse.processed_sco_ai_metadata = { status: "AI processing skipped due to manifest error" };
     } else {
       apiResponse.manifest_data = manifestData;
-      console.log('Manifest parsed successfully:', manifestData);
+      console.log('Manifest parsed successfully.');
 
       if (manifestData.scos && manifestData.scos.length > 0) {
-        const firstScoToProcess = manifestData.scos[0]; // Process the first SCO
-        console.log(`Attempting to process first SCO: ${JSON.stringify(firstScoToProcess)}`);
+        const firstScoToProcess = manifestData.scos[0];
+        console.log(`Attempting to process first SCO: Title: "${firstScoToProcess.title}", Href: "${firstScoToProcess.href}"`);
 
         apiResponse.processed_sco_title = firstScoToProcess.title || firstScoToProcess.identifier || 'Unknown SCO';
         apiResponse.processed_sco_href = firstScoToProcess.href;
 
-        // Check if the SCO href points to an HTML file, ignoring query parameters
         if (firstScoToProcess.href && firstScoToProcess.href.split('?')[0].toLowerCase().endsWith('.html')) {
-          const htmlFilePath = path.join(extractDir, firstScoToProcess.href.split('?')[0]);
-          console.log(`Full path to HTML SCO: ${htmlFilePath}`);
+          const htmlFileRelativePath = firstScoToProcess.href.split('?')[0]; // Path relative to SCORM root
+          const htmlFilePath = path.join(extractDir, htmlFileRelativePath);
+          console.log(`Full path to HTML SCO for text extraction: ${htmlFilePath}`);
 
           if (existsSync(htmlFilePath)) {
             const textExtractionResult = await extractTextFromHtml(htmlFilePath);
@@ -343,6 +340,7 @@ app.post('/api/upload-scorm', upload.single('file'), async (req, res) => {
                 }
               } else {
                 console.log('Extracted text content was empty, skipping AI metadata.');
+                apiResponse.processed_sco_text_content = ""; // Ensure it's set even if empty
                 apiResponse.processed_sco_ai_metadata = { status: 'AI processing skipped due to empty text content' };
               }
             } else { // Error object from extractTextFromHtml
@@ -356,8 +354,8 @@ app.post('/api/upload-scorm', upload.single('file'), async (req, res) => {
             apiResponse.processed_sco_ai_metadata = { status: 'AI processing skipped due to HTML file not found' };
           }
         } else {
-          console.log('First SCO is not an HTML file or href is missing.');
-          apiResponse.processed_sco_note = "First SCO is not an HTML file or href is missing.";
+          console.log('First SCO is not an HTML file or href is missing/invalid.');
+          apiResponse.processed_sco_note = "First SCO is not an HTML file or href is missing/invalid.";
           apiResponse.processed_sco_ai_metadata = { status: 'AI processing skipped, first SCO not HTML or href missing' };
         }
       } else {
@@ -374,20 +372,29 @@ app.post('/api/upload-scorm', upload.single('file'), async (req, res) => {
     // Ensure multer temporary file is cleaned up if it exists and an error occurs before manual deletion
     if (req.file && req.file.path && existsSync(req.file.path)) {
         try {
-            await fs.unlink(req.file.path);
+            await fs.unlink(req.file.path); // Use async unlink
             console.log(`Cleaned up multer temp file due to error: ${req.file.path}`);
         } catch (cleanupErr) {
             console.error(`Error cleaning up multer temp file ${req.file.path}:`, cleanupErr);
         }
     }
     return res.status(500).json({ error: 'An unexpected server error occurred.', details: error.message });
+  } finally {
+    // Clean up the uploaded zip file from multer's temp storage if it still exists
+    // This is a fallback, as it should be deleted after successful extraction or in the catch block
+    if (req.file && req.file.path && existsSync(req.file.path)) {
+        try {
+            await fs.unlink(req.file.path);
+            console.log(`Ensured cleanup of multer temp file: ${req.file.path}`);
+        } catch (finalCleanupErr) {
+            console.error(`Error in final cleanup of multer temp file ${req.file.path}:`, finalCleanupErr);
+        }
+    }
   }
 });
 
 
-// --- Placeholder for other API routes (e.g., todos) ---
-// You would typically move these to a separate file like backend/routes/todoRoutes.js
-// For now, keeping the mock todos here for simplicity if not using apiRoutes import.
+// --- Example API routes (e.g., for todos, can be moved to backend/routes/todoRoutes.js) ---
 let todos = [
   { id: 1, title: "Learn Express", completed: false },
   { id: 2, title: "Learn React", completed: false },
@@ -398,44 +405,53 @@ app.get('/api/todos', (req, res) => {
   res.json(todos);
 });
 
-// (Add other todo routes: GET /api/todos/:id, POST /api/todos, PUT /api/todos/:id, DELETE /api/todos/:id if needed for PoC)
+// Add other todo routes (GET /api/todos/:id, POST /api/todos, PUT /api/todos/:id, DELETE /api/todos/:id)
+// if you plan to use them for the PoC or want Bolt.new to have them as examples.
 
 
 // --- Serve React Frontend (for production builds) ---
-// This section should serve your 'dist' folder from the frontend build
-const FRONTEND_DIST_DIR = path.join(__dirname, '../../src/dist'); // Adjust path if frontend is in 'src' and builds to 'src/dist'
-                                                              // Or more commonly: path.join(__dirname, '../frontend/dist') if you have a separate frontend folder
-                                                              // Or path.join(__dirname, '../dist') if your root package.json builds frontend to root 'dist'
+// Adjust this path based on your actual frontend build output structure
+// If your root package.json builds the frontend into a 'dist' folder at the project root:
+const FRONTEND_DIST_DIR = path.join(__dirname, '../dist'); 
+// If your frontend is in 'src' and builds into 'src/dist':
+// const FRONTEND_DIST_DIR = path.join(__dirname, '../../src/dist'); 
 
 if (existsSync(FRONTEND_DIST_DIR)) {
     app.use(express.static(FRONTEND_DIST_DIR));
+    // Serves the index.html for any routes not handled by the API
     app.get('*', (req, res) => {
         res.sendFile(path.resolve(FRONTEND_DIST_DIR, 'index.html'));
     });
     console.log(`Serving static files from: ${FRONTEND_DIST_DIR}`);
 } else {
-    console.warn(`Frontend build directory not found at: ${FRONTEND_DIST_DIR}. Ensure your frontend is built and the path is correct.`);
+    console.warn(`Frontend build directory not found at: ${FRONTEND_DIST_DIR}.`);
+    console.warn(`Current __dirname (for backend/server.js) is: ${__dirname}`);
+    console.warn(`Expected frontend dist relative to __dirname: ../dist or ../../src/dist`);
     // Fallback root route if frontend isn't built/served
     app.get('/', (req, res) => {
-      res.send('SynapticX API Server is running. Frontend not found or not built.');
+      res.send('SynapticX API Server is running. Frontend not found or not built. Access API at /api/upload-scorm (POST).');
     });
 }
 
 
 // --- Error Handlers (Generic) ---
+// This should be placed after all route definitions
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+    console.error('File size limit exceeded:', err.message);
     return res.status(413).json({ error: `File too large. Maximum file size is 200MB. Details: ${err.message}` });
-  } else if (err) {
-    console.error("Unhandled error caught by generic error handler:", err.stack);
+  } else if (err) { // Catch other errors that might have been passed with next(err)
+    console.error("Unhandled error caught by generic error handler:", err.stack || err.message);
     return res.status(500).json({ error: "An unexpected server error occurred.", details: err.message });
   }
-  next();
+  // If no error, but route not found by this point, it will be a 404 (handled by client-side routing or a specific 404 handler if added)
+  next(); 
 });
 
 
 // --- Start Server ---
 app.listen(PORT, () => {
   console.log(`SynapticX Backend Server is running on port ${PORT}`);
-  console.log(`Expecting GEMINI_API_KEY: ${process.env.GEMINI_API_KEY ? 'Found' : 'NOT FOUND (check .env file in project root)'}`);
+  console.log(`To test, POST a SCORM .zip file to /api/upload-scorm`);
+  console.log(`Expecting GEMINI_API_KEY: ${process.env.GEMINI_API_KEY ? 'Found and loaded!' : 'NOT FOUND (check .env file in project root and ensure server was restarted after creating/modifying it!)'}`);
 });
