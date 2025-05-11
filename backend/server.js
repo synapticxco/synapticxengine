@@ -71,6 +71,7 @@ async function parseScormManifest(extractDirPath) {
     }
 
     const xmlContent = await fs.readFile(manifestPath, 'utf-8');
+    // explicitRoot: true ensures the root tag 'manifest' is part of the result object
     const parser = new xml2js.Parser({ explicitArray: false, ignoreAttrs: false, mergeAttrs: true, explicitRoot: true });
     const result = await parser.parseStringPromise(xmlContent);
 
@@ -81,9 +82,12 @@ async function parseScormManifest(extractDirPath) {
     const manifest = result.manifest;
 
     let courseTitle = 'Untitled Course';
+    // Try to find title in organizations -> organization -> title
     if (manifest.organizations && manifest.organizations.organization) {
       const org = Array.isArray(manifest.organizations.organization) ? manifest.organizations.organization[0] : manifest.organizations.organization;
       if (org && org.title) {
+        // xml2js with explicitArray: false often makes single text nodes direct properties
+        // If title is an object like { _: "Title Text" } due to attributes on title, access with ._
         courseTitle = typeof org.title === 'string' ? org.title : (org.title._ || 'Untitled Organization');
       }
     }
@@ -94,34 +98,42 @@ async function parseScormManifest(extractDirPath) {
                       : [];
 
     const items = [];
+    // Helper function to recursively collect all items
+    const collectAllItems = (itemElement) => {
+        if (!itemElement) return;
+        const currentItems = Array.isArray(itemElement) ? itemElement : [itemElement];
+        currentItems.forEach(it => {
+            if (it) { // Ensure item itself is not null/undefined
+                items.push(it);
+                if (it.item) { // Recursively collect sub-items
+                    collectAllItems(it.item);
+                }
+            }
+        });
+    };
+    
     if (manifest.organizations && manifest.organizations.organization) {
         const org = Array.isArray(manifest.organizations.organization) ? manifest.organizations.organization[0] : manifest.organizations.organization;
         if (org && org.item) {
-            const collectItems = (itemArray) => {
-                (Array.isArray(itemArray) ? itemArray : [itemArray]).forEach(it => {
-                    if (it) {
-                        items.push(it);
-                        if (it.item) {
-                            collectItems(it.item);
-                        }
-                    }
-                });
-            };
-            collectItems(org.item);
+            collectAllItems(org.item);
         }
     }
     
     const resourceMap = new Map();
     resources.forEach(res => {
+        // Attributes are typically under '$' when mergeAttrs is false, or directly if mergeAttrs is true
+        // With mergeAttrs: true, res.identifier should work if identifier is an attribute
         if (res.identifier && res.href) {
             resourceMap.set(res.identifier, res.href);
         }
     });
 
     items.forEach(item => {
+        // item.identifierref should be directly accessible if mergeAttrs: true
         if (item.identifierref && resourceMap.has(item.identifierref)) {
             const resourceDetails = resources.find(r => r.identifier === item.identifierref);
             // Check for SCORM type 'sco', often namespaced with adlcp or similar
+            // With mergeAttrs: true, attributes like 'adlcp:scormtype' become object keys
             const scormType = resourceDetails ? (resourceDetails['adlcp:scormtype'] || resourceDetails.scormtype) : null;
 
             if (scormType === 'sco') {
@@ -130,7 +142,7 @@ async function parseScormManifest(extractDirPath) {
                     scoTitle = item.title;
                 } else if (item.title && item.title._) { // Handle cases where title is an object like {"_": "Title text"}
                      scoTitle = item.title._;
-                } else if (item.identifier) { // Fallback to item identifier
+                } else if (item.identifier) { // Fallback to item identifier if available
                     scoTitle = item.identifier;
                 }
 
@@ -174,7 +186,8 @@ async function extractTextFromHtml(htmlFilePath) {
         text = document.body.textContent || "";
     }
     
-    const cleanedText = text.replace(/\s\s+/g, ' ').trim(); // Replace multiple spaces/newlines with single space
+    // Replace multiple whitespace characters (including newlines, tabs) with a single space and trim
+    const cleanedText = text.replace(/\s\s+/g, ' ').trim();
     
     console.log(`extractTextFromHtml: Extracted ${cleanedText.length} characters from ${htmlFilePath}. Preview: "${cleanedText.substring(0,100)}..."`);
     return cleanedText; // Return text string directly on success
@@ -230,6 +243,7 @@ Respond *only* with the JSON object, without any leading or trailing text or mar
 
     if (apiResponse.status === 200) {
       const data = apiResponse.data;
+      // Robustly try to get to the text part that contains our JSON
       if (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text) {
         const jsonTextResponse = data.candidates[0].content.parts[0].text;
         console.log('getGeminiMetadata: Received text from Gemini, attempting to parse as JSON.');
@@ -255,7 +269,7 @@ Respond *only* with the JSON object, without any leading or trailing text or mar
     }
   } catch (error) {
     console.error('getGeminiMetadata: Gemini API request exception:', error.message);
-    if (error.response) {
+    if (error.response) { // Axios wraps HTTP errors in error.response
       console.error('getGeminiMetadata: Error response data:', error.response.data);
       console.error('getGeminiMetadata: Error response status:', error.response.status);
       return { error: 'Gemini API request exception', details: error.message, status: error.response.status, data: error.response.data };
@@ -265,8 +279,11 @@ Respond *only* with the JSON object, without any leading or trailing text or mar
 }
 
 // --- Main SCORM Upload Route ---
+// This route should be defined under /api/ as per your apiRoutes import,
+// or if apiRoutes.js doesn't exist or define it, it should be app.post('/api/upload-scorm', ...)
+// For now, assuming it's directly on app for simplicity if apiRoutes is not yet set up.
 app.post('/api/upload-scorm', upload.single('file'), async (req, res) => {
-  console.log('Received /api/upload-scorm request');
+  console.log(`Received request for /api/upload-scorm. File: ${req.file ? req.file.originalname : 'No file'}`);
   if (!req.file) {
     console.log('No file uploaded with the request.');
     return res.status(400).json({ error: "No file uploaded with the request." });
@@ -292,11 +309,12 @@ app.post('/api/upload-scorm', upload.single('file'), async (req, res) => {
     zip.extractAllTo(extractDir, /*overwrite*/ true);
     console.log('ZIP file extracted successfully.');
     
+    console.log('Parsing SCORM manifest...');
     const manifestData = await parseScormManifest(extractDir);
 
     const apiResponse = {
       message: "File uploaded and processed.",
-      extracted_content_path: extractDir,
+      extracted_content_path: extractDir, // For debugging, can be removed in production
       manifest_parsing_status: manifestData.error ? "error" : "success",
     };
 
@@ -309,13 +327,14 @@ app.post('/api/upload-scorm', upload.single('file'), async (req, res) => {
       console.log('Manifest parsed successfully.');
 
       if (manifestData.scos && manifestData.scos.length > 0) {
-        const firstScoToProcess = manifestData.scos[0];
+        const firstScoToProcess = manifestData.scos[0]; // Process the first SCO
         console.log(`Attempting to process first SCO: Title: "${firstScoToProcess.title}", Href: "${firstScoToProcess.href}"`);
 
         apiResponse.processed_sco_title = firstScoToProcess.title || firstScoToProcess.identifier || 'Unknown SCO';
         apiResponse.processed_sco_href = firstScoToProcess.href;
 
-        if (firstScoToProcess.href && firstScoToProcess.href.split('?')[0].toLowerCase().endsWith('.html')) {
+        // Check if the SCO href points to an HTML file, ignoring query parameters
+        if (firstScoToProcess.href && typeof firstScoToProcess.href === 'string' && firstScoToProcess.href.split('?')[0].toLowerCase().endsWith('.html')) {
           const htmlFileRelativePath = firstScoToProcess.href.split('?')[0]; // Path relative to SCORM root
           const htmlFilePath = path.join(extractDir, htmlFileRelativePath);
           console.log(`Full path to HTML SCO for text extraction: ${htmlFilePath}`);
@@ -323,15 +342,16 @@ app.post('/api/upload-scorm', upload.single('file'), async (req, res) => {
           if (existsSync(htmlFilePath)) {
             const textExtractionResult = await extractTextFromHtml(htmlFilePath);
 
-            if (typeof textExtractionResult === 'string') { // Success from extractTextFromHtml
+            // extractTextFromHtml returns a string on success, or an object with an error key on failure
+            if (typeof textExtractionResult === 'string') { 
               apiResponse.processed_sco_text_content = textExtractionResult.length > 500
                 ? textExtractionResult.substring(0, 500) + "..."
                 : textExtractionResult;
               
-              if (textExtractionResult.trim()) {
+              if (textExtractionResult.trim()) { // Only call Gemini if there's actual text
                 const geminiApiKey = process.env.GEMINI_API_KEY;
                 if (geminiApiKey) {
-                  console.log('GEMINI_API_KEY found, calling getGeminiMetadata...');
+                  console.log('GEMINI_API_KEY found, calling getGeminiMetadata with extracted text...');
                   const metadata = await getGeminiMetadata(textExtractionResult, geminiApiKey);
                   apiResponse.processed_sco_ai_metadata = metadata;
                 } else {
@@ -381,7 +401,7 @@ app.post('/api/upload-scorm', upload.single('file'), async (req, res) => {
     return res.status(500).json({ error: 'An unexpected server error occurred.', details: error.message });
   } finally {
     // Clean up the uploaded zip file from multer's temp storage if it still exists
-    // This is a fallback, as it should be deleted after successful extraction or in the catch block
+    // This is a fallback, as it should be deleted after successful extraction or in the catch block for the main try
     if (req.file && req.file.path && existsSync(req.file.path)) {
         try {
             await fs.unlink(req.file.path);
@@ -394,7 +414,8 @@ app.post('/api/upload-scorm', upload.single('file'), async (req, res) => {
 });
 
 
-// --- Example API routes (e.g., for todos, can be moved to backend/routes/todoRoutes.js) ---
+// --- Example API routes (e.g., for todos) ---
+// These would typically be in backend/routes/todoRoutes.js and imported
 let todos = [
   { id: 1, title: "Learn Express", completed: false },
   { id: 2, title: "Learn React", completed: false },
@@ -406,19 +427,19 @@ app.get('/api/todos', (req, res) => {
 });
 
 // Add other todo routes (GET /api/todos/:id, POST /api/todos, PUT /api/todos/:id, DELETE /api/todos/:id)
-// if you plan to use them for the PoC or want Bolt.new to have them as examples.
+// if you plan to use them for the PoC.
 
 
 // --- Serve React Frontend (for production builds) ---
 // Adjust this path based on your actual frontend build output structure
 // If your root package.json builds the frontend into a 'dist' folder at the project root:
 const FRONTEND_DIST_DIR = path.join(__dirname, '../dist'); 
-// If your frontend is in 'src' and builds into 'src/dist':
-// const FRONTEND_DIST_DIR = path.join(__dirname, '../../src/dist'); 
+// If your frontend is in 'src' and builds into 'src/dist' (relative to project root):
+// const FRONTEND_DIST_DIR = path.join(__dirname, '../src/dist'); // More likely if src is frontend root
 
 if (existsSync(FRONTEND_DIST_DIR)) {
     app.use(express.static(FRONTEND_DIST_DIR));
-    // Serves the index.html for any routes not handled by the API
+    // Serves the index.html for any routes not handled by the API, enabling client-side routing
     app.get('*', (req, res) => {
         res.sendFile(path.resolve(FRONTEND_DIST_DIR, 'index.html'));
     });
@@ -426,7 +447,6 @@ if (existsSync(FRONTEND_DIST_DIR)) {
 } else {
     console.warn(`Frontend build directory not found at: ${FRONTEND_DIST_DIR}.`);
     console.warn(`Current __dirname (for backend/server.js) is: ${__dirname}`);
-    console.warn(`Expected frontend dist relative to __dirname: ../dist or ../../src/dist`);
     // Fallback root route if frontend isn't built/served
     app.get('/', (req, res) => {
       res.send('SynapticX API Server is running. Frontend not found or not built. Access API at /api/upload-scorm (POST).');
@@ -435,16 +455,18 @@ if (existsSync(FRONTEND_DIST_DIR)) {
 
 
 // --- Error Handlers (Generic) ---
-// This should be placed after all route definitions
+// This should be placed after all route definitions and app.use(express.static...)
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
     console.error('File size limit exceeded:', err.message);
     return res.status(413).json({ error: `File too large. Maximum file size is 200MB. Details: ${err.message}` });
-  } else if (err) { // Catch other errors that might have been passed with next(err)
+  } else if (err) { 
     console.error("Unhandled error caught by generic error handler:", err.stack || err.message);
+    // Avoid sending detailed stack in production, but helpful for PoC
     return res.status(500).json({ error: "An unexpected server error occurred.", details: err.message });
   }
-  // If no error, but route not found by this point, it will be a 404 (handled by client-side routing or a specific 404 handler if added)
+  // If no error, but route not found by this point, it will be handled by the '*' route if frontend is served,
+  // or will result in a 404 if not.
   next(); 
 });
 
