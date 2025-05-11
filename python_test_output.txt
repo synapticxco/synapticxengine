@@ -1,0 +1,12 @@
+Python script started at: 2025-05-10 05:55:41.457000
+Python script is running!
+Python Executable: 
+Python Version: 3.11.0alpha (heads/main-dirty:77939d2ca, Sep  1 2023, 04:55:28) 
+[rustc 1.71.1]
+Initial Current Working Directory (from app.py): /home/project
+Script __file__ directory: /home/project/backend
+Current Working Directory (after potential adjustments): /home/project
+Python Path:
+- backend
+- /home/project
+--- End of Python Test Script ---
